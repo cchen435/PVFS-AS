@@ -1,0 +1,250 @@
+ /* 
+ * (C) 2001 Clemson University and The University of Chicago 
+ *
+ * See COPYING in top-level directory.
+ */
+
+/*
+ *  PVFS2 server state machine for driving write I/O operations.
+ */
+
+#include <string.h>
+#include <assert.h>
+
+#include "server-config.h"
+#include "pvfs2-server.h"
+#include "pvfs2-attr.h"
+#include "pvfs2-request.h"
+#include "pint-distribution.h"
+#include "pint-request.h"
+#include "pvfs2-internal.h"
+#include "pipeline.h"
+#include "trove.h"
+#include "pint-segpool.h"
+
+%%
+
+nested machine pvfs2_write_sm
+{
+    state bmi_recv
+    {
+        run bmi_recv_call;
+        default => trove_write;
+    }
+
+    state trove_write
+    {
+        run trove_write_call;
+        default => check;
+    }
+
+    state check
+    {
+        run check_done;
+	success => finished;
+        LOOP => bmi_recv;
+    }
+
+    state finished
+    {
+        run epilog;
+        default => return;
+    }
+}
+
+%%
+
+/*
+ * PINT_process_request() -> job_bmi_recv()
+ */
+static PINT_sm_action bmi_recv_call(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    PINT_segpool_handle_t seg_handle = s_op->u.pipeline.seg_handle;
+    PINT_segpool_unit_id id = s_op->u.pipeline.id;
+    int ret;
+    job_id_t tmp_id;
+    struct server_configuration_s *user_opts = get_server_config_struct();
+    int count;
+    PVFS_offset *offsets;
+    PVFS_size *sizes;
+    PVFS_size bytes;
+
+    s_op->u.pipeline.buffer_used = 0;
+    bytes = s_op->u.pipeline.buffer_size;
+
+    PINT_segpool_take_segments(seg_handle, id, &bytes, &count, 
+			       &offsets, &sizes);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: 3: count=%d, bytes=%ld\n", 
+		 __func__, count, bytes);
+
+    if(count == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+
+    s_op->u.pipeline.buffer_used = bytes;
+    s_op->u.pipeline.offsets = offsets;
+    s_op->u.pipeline.sizes = sizes;
+    s_op->u.pipeline.segs = count;
+
+    ret = job_bmi_recv(s_op->u.pipeline.address,
+		       (void *)s_op->u.pipeline.buffer,
+		       s_op->u.pipeline.buffer_size,
+		       s_op->u.pipeline.tag,
+		       BMI_PRE_ALLOC, 
+		       smcb, 
+		       1, /* unsigned long status_user_tag = 0 */
+		       js_p,
+		       &tmp_id,
+		       server_job_context,
+		       user_opts->server_job_flow_timeout,
+		       (bmi_hint)s_op->u.pipeline.hints);
+    
+    if(ret < 0) {
+	gossip_err("%s: I/O error occurred\n", __func__);
+	/* FIXME: need to handle I/O error */
+	//handle_io_error(ret, q_item, flow_data);
+	js_p->error_code = -PVFS_EIO;
+	return SM_ACTION_COMPLETE;
+    }
+    /* immediate return */
+    if(ret == 1) {
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+    if(ret == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_DEFERRED;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action trove_write_call(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    int ret;
+    job_id_t tmp_id;
+    struct filesystem_configuration_s *fs_config;
+    struct server_configuration_s *server_config;
+
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: buffer_used=%ld\n", __func__, 
+		 s_op->u.pipeline.buffer_used);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: actual_size=%ld\n", __func__,
+		 js_p->actual_size);
+#if 0
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: buffer[0]=%s\n", __func__,
+		 (char *)s_op->u.pipeline.buffer);
+#endif
+
+    if(s_op->u.pipeline.buffer_used == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+
+    /* figure out if the fs config has trove data sync turned on or off
+     */
+    server_config = get_server_config_struct();
+    if(!server_config)
+    {
+        gossip_err("write_io: server config is NULL!\n");
+        js_p->error_code = -PVFS_EINVAL;
+        return SM_ACTION_COMPLETE;
+    }
+    
+    fs_config = PINT_config_find_fs_id(
+        server_config, s_op->u.pipeline.coll_id);
+    if(!fs_config)
+    {
+        gossip_err("write_io: Failed to get filesystem "
+                   "config from fs_id of: %d\n",
+                   s_op->u.pipeline.coll_id);
+        js_p->error_code = -PVFS_EINVAL;
+        return SM_ACTION_COMPLETE;
+    }
+    
+    ret = job_trove_bstream_write_list(
+				       s_op->u.pipeline.coll_id,
+				       s_op->u.pipeline.handle,
+				       (char **)&s_op->u.pipeline.buffer,
+				       (TROVE_size *)&js_p->actual_size,
+				       1,
+				       s_op->u.pipeline.offsets,
+				       s_op->u.pipeline.sizes,
+				       s_op->u.pipeline.segs,
+				       &s_op->u.pipeline.out_size,
+				       (fs_config->trove_sync_data ? TROVE_SYNC : 0),
+				       NULL,
+				       smcb,
+				       0,
+				       js_p,
+				       &tmp_id,
+				       server_job_context,
+				       s_op->u.pipeline.hints);
+
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: ret=%d\n", __func__, ret);
+    if(ret < 0) {
+	gossip_err("%s: I/O error occurred\n", __func__);
+	//handle_io_error(ret, q_item, flow_data);
+	/* FIXME ***************/
+	js_p->error_code = -PVFS_ENOMEM;
+	return SM_ACTION_COMPLETE;
+    }
+
+    if(ret == 1) {
+	/* immediate completion */
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+
+    if(ret == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_DEFERRED;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action check_done(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    PINT_segpool_handle_t h = s_op->u.pipeline.seg_handle;
+    js_p->error_code = 0;
+    struct PINT_server_op *parent_s_op = s_op->u.pipeline.parent;
+
+    parent_s_op->u.io.total_transferred += s_op->u.pipeline.out_size;
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: total_transferred=%ld\n", __func__,
+		 parent_s_op->u.io.total_transferred);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: buffer_used=%ld\n", __func__,
+		 s_op->u.pipeline.buffer_used);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: out_size=%ld\n", __func__,
+		 s_op->u.pipeline.out_size);
+
+    if(!segpool_done(h)) {
+	gossip_debug(GOSSIP_IO_DEBUG, "%s: write: LOOP\n", __func__);
+	js_p->error_code = LOOP;
+    }
+    else {
+	gossip_debug(GOSSIP_IO_DEBUG, "%s: write: DONE\n", __func__);
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action epilog(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    js_p->error_code = 0;
+
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * Local variables:
+ *  mode: c
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

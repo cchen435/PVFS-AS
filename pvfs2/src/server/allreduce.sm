@@ -1,0 +1,262 @@
+/* 
+ * (C) 2001 Clemson University and The University of Chicago 
+ *
+ * See COPYING in top-level directory.
+ */
+
+/*
+ *  PVFS2 server state machine for driving read I/O operations.
+ */
+
+#include <string.h>
+#include <assert.h>
+
+#include "server-config.h"
+#include "pvfs2-server.h"
+#include "pvfs2-attr.h"
+#include "pvfs2-request.h"
+#include "pint-distribution.h"
+#include "pint-request.h"
+#include "pvfs2-internal.h"
+#include "pint-cached-config.h"
+#include "trove.h"
+
+#define CONTINUE_ALLREDUCE 201
+#define ALLREDUCE_TAG 3333
+
+%%
+
+nested machine pvfs2_send_recv_sm
+{
+    state send_recv
+    {
+	run send_recv_fn;
+	success => epilog;
+    }
+
+    state epilog
+    {
+	run dummy_epilog;
+        default => return;
+    }
+}
+
+nested machine pvfs2_allreduce_sm
+{
+    state allreduce
+    {
+        pjmp allreduce_fn
+	{
+	    success => pvfs2_send_recv_sm;
+	}
+        success => check_allreduce;
+    }
+
+    state check_allreduce
+    {
+	run check_allreduce_done;
+	CONTINUE_ALLREDUCE => allreduce;
+	default => return;
+    }
+}
+
+%%
+
+/*
+ */
+static PINT_sm_action send_recv_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct PINT_server_op *parent_s_op = PINT_sm_frame(smcb->parent_smcb, 0);
+    struct server_configuration_s *user_opts = get_server_config_struct();
+    job_id_t tmp_id;
+    int ret;
+    int myRank = s_op->u.send_recv.myRank, newRank;
+    PVFS_handle new_rank_handle;
+    PVFS_BMI_addr_t svr_addr;
+    PVFS_msg_tag_t session_tag = ALLREDUCE_TAG;
+
+    js_p->error_code = 0;
+
+    newRank = myRank^(s_op->u.send_recv.mask);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: mask=0x%x, myRank=%d, newRank=%d\n", 
+		 (s_op->u.send_recv.type==0?"SEND":"RECV"),
+		 s_op->u.send_recv.mask, myRank, newRank);
+    new_rank_handle = parent_s_op->u.allreduce.dfile_array[newRank];
+    gossip_debug(GOSSIP_IO_DEBUG, "new_rank_handle=%llu\n", llu(new_rank_handle));
+    ret = PINT_cached_config_map_to_server(&svr_addr,
+					   new_rank_handle,
+					   parent_s_op->u.allreduce.fs_id);
+
+    if(ret < 0) {
+	gossip_err("Failed to map meta server address\n");
+	js_p->error_code = ret;
+	return SM_ACTION_COMPLETE;
+    }
+
+    /* RECV */
+    if(s_op->u.send_recv.type == 1) {
+	ret = job_bmi_recv(svr_addr,
+			   (void*)parent_s_op->u.allreduce.recv_buf,
+			   parent_s_op->u.allreduce.buf_sz,
+			   session_tag,
+			   BMI_PRE_ALLOC,
+			   smcb,
+			   0,
+			   js_p,
+			   &tmp_id,
+			   server_job_context,
+			   user_opts->server_job_bmi_timeout,
+			   (bmi_hint)parent_s_op->u.allreduce.hints);
+	
+	if(ret == 1) {
+	    js_p->error_code = ret;
+	    return SM_ACTION_COMPLETE;
+	}
+	
+	if(ret == 0) {
+	    js_p->error_code = ret;
+	    return SM_ACTION_DEFERRED;
+	}
+    }
+    /* SEND */
+    else if(s_op->u.send_recv.type == 0) {
+	ret = job_bmi_send(svr_addr,
+			   (void*)parent_s_op->u.allreduce.send_buf,
+			   parent_s_op->u.allreduce.buf_sz,
+			   session_tag,
+			   BMI_PRE_ALLOC,
+			   0, /* 1: send_unexpected */
+			   smcb,
+			   0,
+			   js_p,
+			   &tmp_id,
+			   server_job_context,
+			   user_opts->server_job_bmi_timeout,
+			   (bmi_hint)parent_s_op->u.allreduce.hints);
+	
+	if(ret == 1) {
+	    js_p->error_code = ret;
+	    return SM_ACTION_COMPLETE;
+	}
+	
+	if(ret == 0) {
+	    js_p->error_code = ret;
+	    return SM_ACTION_DEFERRED;
+	}
+    }
+
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ */
+static PINT_sm_action dummy_epilog(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action allreduce_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct PINT_server_op *send_recv_op;
+    int i, ret;
+
+    for(i=0; i<2; i++) {
+	send_recv_op = malloc(sizeof(*send_recv_op));
+	memset(send_recv_op, 0, sizeof(*send_recv_op));
+    
+	if(i==0)
+	    send_recv_op->u.send_recv.type = 0; /* SEND */
+	else if(i==1)
+	    send_recv_op->u.send_recv.type = 1; /* RECV */
+
+	send_recv_op->u.send_recv.myRank = s_op->u.allreduce.myRank;
+	send_recv_op->u.send_recv.mask = s_op->u.allreduce.mask;
+
+	ret = PINT_sm_push_frame(smcb, 0, send_recv_op);
+    }
+
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action check_allreduce_done(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct PINT_server_op *send_recv_op;
+    int task_id, remaining, i, ii;
+    PVFS_error tmp_err;
+
+    s_op->u.allreduce.current_depth++;
+    s_op->u.allreduce.mask <<= 1;
+
+    for(ii=0; ii<2; ii++) {
+	send_recv_op = PINT_sm_pop_frame(smcb, &task_id, &tmp_err, 
+					 &remaining);
+
+	gossip_debug(GOSSIP_IO_DEBUG, "%s: i=%d, type=%d, remaining=%d\n", 
+		     __func__, ii, send_recv_op->u.send_recv.type, remaining);
+
+	if(send_recv_op->u.send_recv.type == 1) { /* if RECV */
+	    switch(s_op->u.allreduce.datatype) {
+	    case ((int)0x4c000405): /* MPI_INT */ 
+		{
+		    int *a = s_op->u.allreduce.send_buf;
+		    int *b = s_op->u.allreduce.recv_buf;
+		    
+		    gossip_debug(GOSSIP_IO_DEBUG, "%s: SUM on INT\n", __func__);
+		    for(i=0; i<(s_op->u.allreduce.buf_sz)/sizeof(int); i++)
+			a[i] = a[i] + b[i];
+		    memcpy(s_op->u.allreduce.send_buf, (void*)a, s_op->u.allreduce.buf_sz);
+		}
+		break;
+	    case ((int)0x4c00040a): /* MPI_FLOAT */ 
+		{
+		    float *a = (float *)s_op->u.allreduce.send_buf;
+		    float *b = (float *)s_op->u.allreduce.recv_buf;
+		    int count = (s_op->u.allreduce.buf_sz)/sizeof(float);
+		    
+		    gossip_debug(GOSSIP_IO_DEBUG, 
+				 "%s: SUM on FLOAT, count=%d, recv_buf[0]=%f, send_buf[0]=%f\n", 
+				 __func__, count, b[0], a[0]);
+		    for(i=0; i<count; i++) {
+			a[i] = a[i] + b[i];
+		    }
+		    memcpy(s_op->u.allreduce.send_buf, (void*)a, 
+			   s_op->u.allreduce.buf_sz);
+		    gossip_debug(GOSSIP_IO_DEBUG, "%s: type=%s: result=%f\n", 
+				 __func__, 
+				 (send_recv_op->u.send_recv.type==0?"SEND":"RECV"), 
+				 a[0]);
+		}
+		break;
+	    default:
+		break;
+	    } /* end switch() */
+	} /* end if() */
+	free(send_recv_op);
+    }
+	
+    gossip_debug(GOSSIP_IO_DEBUG, "current_depth=%d, tree_depth=%d\n",
+		 s_op->u.allreduce.current_depth, 
+		 s_op->u.allreduce.tree_depth);
+    if(s_op->u.allreduce.current_depth < s_op->u.allreduce.tree_depth)
+	js_p->error_code = CONTINUE_ALLREDUCE;
+    else
+	js_p->error_code = 0;
+
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * Local variables:
+ *  mode: c
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

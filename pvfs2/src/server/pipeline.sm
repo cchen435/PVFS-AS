@@ -1,0 +1,1254 @@
+/* 
+ * (C) 2001 Clemson University and The University of Chicago 
+ *
+ * See COPYING in top-level directory.
+ */
+
+/*
+ *  PVFS2 server state machine for driving read/write I/O operations.
+ */
+#define _ISOC99_SOURCE /* log2, ceil, max, etc */ 
+
+#include <string.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <math.h> /* log2() */
+
+#include "server-config.h"
+#include "pvfs2-server.h"
+#include "pvfs2-attr.h"
+#include "pvfs2-request.h"
+#include "pint-distribution.h"
+#include "pvfs2-dist-simple-stripe.h"
+#include "pint-request.h"
+#include "pvfs2-internal.h"
+#include "trove.h"
+#include "pint-util.h"
+#include "pint-cached-config.h"
+
+#define DONE 101
+#define UNALIGNED 102
+#define DO_COMP 103
+#define DO_ALLREDUCE 104
+#define DO_KMEANS 105
+#define DO_VOLREN 106 /* volume rendering */
+#define DO_FASTBIT 107 /* FastBit */
+
+static int s2s_comp_fn(
+    void *v_p, struct PVFS_server_resp *resp_p, int index);
+
+/* FIXME: kmeans.sm also has similar one */
+int GPU_initialized = 0;
+
+int NUM_OBJS; /* for kmeans only */
+int NUM_COORDS = 1; /* for kmeans only */
+int NUM_CLUSTERS; /* for kmeans only */
+#define TMP_BUF_SIZ 128
+
+extern double bmi_time, trove_time; /* sson */
+double bs1, bs2, br1, br2, tr1, tr2, tw1, tw2;
+
+%%
+
+nested machine pvfs2_pipeline_sm
+{
+    state fetch
+    {
+        run fetch_data;
+        success => dispatch;
+        DONE => return;
+    }
+
+    state dispatch
+    {
+        run dispatch_data;
+	DO_COMP => check_align;
+        default => check_pipeline;
+    }
+
+    state check_align
+    {
+	run check_align_fn;
+	UNALIGNED => setup_s2s;
+	success => do_comp;
+    }
+
+    state setup_s2s
+    {
+	run setup_s2s_msg;
+	success => s2s_exchange;
+    }
+
+    state s2s_exchange
+    {
+	jump pvfs2_msgpairarray_sm;
+	success => do_comp;
+    }
+
+    state do_comp
+    {
+	run do_comp_fn;
+	DO_KMEANS => setup_kmeans;
+	success => check_pipeline;
+    }
+
+    state setup_kmeans
+    {
+	run setup_kmeans_fn;
+	success => run_kmeans;
+    }
+
+    state run_kmeans
+    {
+	jump pvfs2_kmeans_sm;
+	success => cleanup_kmeans;
+    }
+
+    state cleanup_kmeans
+    {
+	run cleanup_kmeans_fn;
+	success => check_pipeline;
+    }
+
+    state check_pipeline
+    {
+        run check_pipeline_done;
+	success => fetch;
+    }
+}
+
+%%
+
+/*
+ * fetch data from either TROVE (in case of READ) or BMI (in case of WRITE)
+ * 
+ *   PINT_segpool_take_segments()
+ *     => READ: job_trove_bstream_read_list()
+ *     => WRITE: job_bmi_recv()
+ */
+static PINT_sm_action fetch_data(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    PINT_segpool_handle_t seg_handle = s_op->u.pipeline.seg_handle;
+    PINT_segpool_unit_id id = s_op->u.pipeline.id;
+    struct server_configuration_s *user_opts = get_server_config_struct();
+    int count, ret, i;
+    PVFS_offset *offsets;
+    PVFS_size *sizes;
+    PVFS_size bytes;
+    job_id_t tmp_id;
+
+    gossip_debug(GOSSIP_IO_DEBUG, "smcb->base_frame=%d, frame_count=%d\n", 
+		 smcb->base_frame, smcb->frame_count);
+    s_op->u.pipeline.buffer_used = 0;
+    bytes = s_op->u.pipeline.buffer_size;
+
+    PINT_segpool_take_segments(seg_handle, id, &bytes, &count, 
+			       &offsets, &sizes);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: %s: bytes=%lld, count=%d\n", 
+		 __func__, 
+		 (s_op->u.pipeline.io_type==PVFS_IO_READ?"READ":"WRITE"),
+		 lld(bytes), count);
+
+    for(i=0; i<count; i++) {
+	gossip_debug(GOSSIP_IO_DEBUG, "offsets[%d]=%lld, sizes[%d]=%lld\n",
+		     i, lld(offsets[i]), i, lld(sizes[i]));
+    }
+
+    if(count == 0) {
+	js_p->error_code = DONE;
+	//gossip_debug(GOSSIP_IO_DEBUG, "%s: count==0?\n", __func__);
+	return SM_ACTION_COMPLETE;
+    }
+
+    s_op->u.pipeline.buffer_used = bytes;
+    s_op->u.pipeline.offsets = offsets;
+    s_op->u.pipeline.sizes = sizes;
+    s_op->u.pipeline.segs = count;
+
+    if(s_op->u.pipeline.io_type == PVFS_IO_READ) {
+        struct timeval tv; 
+        gettimeofday(&tv, NULL);
+        tr1 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("start(%s): %f\n", "TROVE_READ", t1);
+	ret = job_trove_bstream_read_list
+	    (s_op->u.pipeline.fs_id,
+	     s_op->u.pipeline.handle,
+	     (char **)&s_op->u.pipeline.buffer,
+	     (PVFS_size *)&s_op->u.pipeline.buffer_used,
+	     1,
+	     offsets,
+	     sizes,
+	     count,
+	     &s_op->u.pipeline.out_size,
+	     s_op->u.pipeline.trove_sync_flag,
+	     NULL,
+	     smcb,
+	     0,
+	     js_p,
+	     &tmp_id,
+	     server_job_context,
+	     s_op->u.pipeline.hints);
+    }
+    else if (s_op->u.pipeline.io_type == PVFS_IO_WRITE) {
+        struct timeval tv; 
+        gettimeofday(&tv, NULL);
+        br1 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("start(%s): %f\n", "BMI_RECV", t1);
+	ret = job_bmi_recv(s_op->u.pipeline.address,
+		       (void *)s_op->u.pipeline.buffer,
+		       s_op->u.pipeline.buffer_size,
+		       s_op->u.pipeline.tag,
+		       BMI_PRE_ALLOC, 
+                       smcb, 
+		       0, /* unsigned long status_user_tag = 0 */
+		       js_p,
+		       &tmp_id,
+		       server_job_context,
+		       user_opts->server_job_flow_timeout,
+                       (bmi_hint)s_op->u.pipeline.hints);
+    }
+
+    if(ret < 0) {
+	gossip_err("%s: I/O error occurred\n", __func__);
+	/* FIXME */
+	//handle_io_error(ret, q_item, flow_data);
+	js_p->error_code = -PVFS_EIO;
+	return SM_ACTION_COMPLETE;
+    }
+
+    /* immediate return */
+    if(ret == 1) {
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+
+    if(ret == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_DEFERRED;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * Dispatch data to either BMI (in case of READ) or TROVE (in case of WRITE)
+ *
+ *   => READ: job_bmi_send()
+ *   => WRITE: job_trove_bstream_write_list()
+ */
+static PINT_sm_action dispatch_data(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    int ret, i;
+    job_id_t tmp_id;
+    struct server_configuration_s *user_opts = get_server_config_struct();
+
+    struct timeval tv; 
+    gettimeofday(&tv, NULL);
+    if(s_op->u.pipeline.io_type==PVFS_IO_READ) {
+        tr2 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("end(%s): %f\n", "TROVE_READ", tr2);
+        trove_time += tr2-tr1;
+    }
+    else if(s_op->u.pipeline.io_type==PVFS_IO_WRITE) {
+        br2 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("end(%s): %f\n", "BMI_RECV", br2);
+        bmi_time += br2-br1;
+    }
+
+    if(s_op->u.pipeline.segs == 0) {
+	js_p->error_code = 0;
+	gossip_debug(GOSSIP_IO_DEBUG, "%s: count==0?\n", __func__);
+	return SM_ACTION_COMPLETE;
+    }
+
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: %s: buffer_used=%lld\n", __func__,
+		 (s_op->u.pipeline.io_type==PVFS_IO_READ?"READ":"WRITE"),
+		 lld(s_op->u.pipeline.buffer_used));
+    for(i=0; i<s_op->u.pipeline.segs; i++) {
+	gossip_debug(GOSSIP_IO_DEBUG, "offsets[%d]=%lld, sizes[%d]=%lld\n",
+		     i, lld(s_op->u.pipeline.offsets[i]), i, 
+		     lld(s_op->u.pipeline.sizes[i]));
+    }
+#if 0
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: buffer[0]=%s\n", __func__,
+		 (char *)s_op->u.pipeline.buffer);
+#endif
+
+    
+    if(s_op->u.pipeline.io_type == PVFS_IO_READ) {
+	assert(s_op->u.pipeline.buffer_used);
+
+        struct timeval tv; 
+        gettimeofday(&tv, NULL);
+        bs1 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("start(%s): %f\n", "BMI_SEND", bs1);
+
+	if(s_op->u.pipeline.op != 0) { /* AS: when op is specified */
+	    ret = DO_COMP; /* AS: skip sending if op is specified */ 
+	    gossip_debug(GOSSIP_IO_DEBUG, "%s: s_op->u.pipeline->op != 0\n", __func__);
+	    js_p->error_code = ret;
+	    return SM_ACTION_COMPLETE;
+	} 
+	else {
+	    ret = job_bmi_send(s_op->u.pipeline.address,
+			       s_op->u.pipeline.buffer,
+			       js_p->actual_size, 
+			       s_op->u.pipeline.tag,
+			       BMI_PRE_ALLOC,
+			       0, /* send_unexpected */
+			       smcb, /* user_ptr */
+			       0, /* status_user_tag */
+			       js_p,
+			       &tmp_id,
+			       server_job_context,
+			       user_opts->server_job_bmi_timeout,
+			       (bmi_hint)s_op->u.pipeline.hints);
+        }
+	
+    }
+    else if(s_op->u.pipeline.io_type == PVFS_IO_WRITE) {
+        struct timeval tv; 
+        gettimeofday(&tv, NULL);
+        tw1 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("start(%s): %f\n", "TROVE_WRITE", t1);
+	ret = job_trove_bstream_write_list
+	    (s_op->u.pipeline.fs_id,
+	     s_op->u.pipeline.handle,
+	     (char **)&s_op->u.pipeline.buffer,
+	     (TROVE_size *)&js_p->actual_size,
+	     1, /* mem_count */
+	     s_op->u.pipeline.offsets,
+	     s_op->u.pipeline.sizes,
+	     s_op->u.pipeline.segs,
+	     &s_op->u.pipeline.out_size,
+	     s_op->u.pipeline.trove_sync_flag,
+	     NULL,
+	     smcb,
+	     0, /* status_user_tag */
+	     js_p,
+	     &tmp_id,
+	     server_job_context,
+	     s_op->u.pipeline.hints);
+    }
+
+    if(ret < 0) {
+	gossip_err("%s: I/O error occurred\n", __func__);
+	/* FIXME !!!!!!! */
+	/* handle_io_error(ret, q_item, flow_data); */
+	js_p->error_code = ret;
+	return SM_ACTION_COMPLETE;
+    }
+    
+    /* immediate return */
+    if(ret == 1) {
+	js_p->error_code = 0;
+	return SM_ACTION_COMPLETE;
+    }
+	
+    if(ret == 0) {
+	js_p->error_code = 0;
+	return SM_ACTION_DEFERRED;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+
+static PINT_sm_action check_align_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    PVFS_size file_req_offset = s_op->u.pipeline.file_req_offset;
+    PINT_request_file_data fdata = s_op->u.pipeline.file_data;
+    PVFS_simple_stripe_params *dparam = 
+	(PVFS_simple_stripe_params*)fdata.dist->params;
+    PVFS_size count;
+    PVFS_offset strip_boundary;
+    PVFS_offset loff = fdata.dist->methods->physical_to_logical_offset(fdata.dist->params, &fdata, s_op->u.pipeline.offsets[0]);
+    js_p->error_code = 0;
+    
+    s_op->u.pipeline.loff = loff;
+    gossip_debug(GOSSIP_IO_DEBUG, "loff=%lld, file_req_offset=%lld\n", lld(loff), lld(file_req_offset));
+
+    switch(s_op->u.pipeline.datatype) {
+    case ((int)0x4c000101): /* MPI_CHAR */
+        count = (PVFS_size)(s_op->u.pipeline.buffer_used - 
+			    file_req_offset)/((*PVFS_CHAR).ub);
+        if(s_op->u.pipeline.op == 0x58000020) { /* GREP */
+            char *tmpbuf = malloc(TMP_BUF_SIZ);
+	    int cunit, length, rsize;
+	    char *tok;
+
+	    memcpy(tmpbuf, PINT_hint_get_value_by_name(s_op->u.pipeline.hints, "grep", &length), TMP_BUF_SIZ);
+	    gossip_debug(GOSSIP_IO_DEBUG, "grep=%s\n", tmpbuf);
+	    tok = strtok(tmpbuf, ":"); /* use_gpu */
+            s_op->u.pipeline.use_gpu = atoi(tok);
+	    tok = strtok(NULL, ":"); /* rsize */
+            s_op->u.pipeline.rsize = atoi(tok);
+            rsize = s_op->u.pipeline.rsize;
+	    tok = strtok(NULL, ":"); /* pattern */
+            strcpy(s_op->u.pipeline.pattern, tok);
+
+            gossip_debug(GOSSIP_IO_DEBUG, "(parsed)grep=%d:%d:%s\n",
+                         s_op->u.pipeline.use_gpu,
+                         s_op->u.pipeline.rsize,
+                         s_op->u.pipeline.pattern);
+	    free(tmpbuf);
+
+            cunit = ((*PVFS_CHAR).ub)*rsize;
+            PVFS_size new_size, left_adj_sz, right_adj_sz;
+	    float ctmp = ((float)(s_op->u.pipeline.buffer_used-file_req_offset))/((*PVFS_CHAR).ub)/rsize;
+	    int is_last_stripe = ((s_op->u.pipeline.dfile_index == (s_op->u.pipeline.dfile_count-1))?1:0);
+
+	    gossip_debug(GOSSIP_IO_DEBUG, "ctmp=%f\n", ctmp);
+
+	    /* last stripe? */
+	    if(is_last_stripe && (s_op->u.pipeline.dfile_index != 0))
+		count = floor(ctmp);
+	    else
+		count = ceil(ctmp);
+
+	    new_size = count*cunit;
+            s_op->u.pipeline.new_buffer_used = new_size;
+	    s_op->u.pipeline.buffer = realloc(s_op->u.pipeline.buffer, max(new_size, s_op->u.pipeline.buffer_used));
+	    left_adj_sz = (loff - file_req_offset)%cunit;
+	    right_adj_sz = (loff+s_op->u.pipeline.buffer_used-file_req_offset)%cunit;
+	    s_op->u.pipeline.left_adj_sz = ((left_adj_sz==0)?0:(cunit-left_adj_sz));
+	    s_op->u.pipeline.right_adj_sz = right_adj_sz;
+	    s_op->u.pipeline.unaligned_sz = ((right_adj_sz==0)?0:(cunit-right_adj_sz));
+	    s_op->u.pipeline.tmp_buf = malloc(s_op->u.pipeline.unaligned_sz);
+	    
+	    gossip_debug(GOSSIP_IO_DEBUG, "CHAR: count=%lld, left_adj_sz=%ld, "
+			 "right_adj_sz=%ld, unaligned_sz=%ld\n", lld(count),
+			 s_op->u.pipeline.left_adj_sz, 
+			 s_op->u.pipeline.right_adj_sz, 
+			 s_op->u.pipeline.unaligned_sz);
+	}
+        gossip_debug(GOSSIP_IO_DEBUG, "strip_size=%ld, count=%lld\n", 
+		     dparam->strip_size, lld(count));
+#if 0            
+	if (loff == strip_boundary && file_req_offset != 0) {
+	    s_op->u.pipeline.unaligned_sz = file_req_offset;
+	}
+#endif
+	if (s_op->u.pipeline.unaligned_sz != 0 && count != 0) {
+            /* if it is the last stripe, no need to bring data */
+	    /* FIXME: we assume no round-robin stripes for now, 
+	       but shound't it be more general? */
+	    if(s_op->u.pipeline.dfile_index != (s_op->u.pipeline.dfile_count-1))
+		js_p->error_code = UNALIGNED;
+	    gossip_debug(GOSSIP_IO_DEBUG, "unaligned_sz=%lld\n", 
+			 lld(s_op->u.pipeline.unaligned_sz));
+	}
+        break;
+    case ((int)0x4c000405): /* MPI_INT */
+	count = (PVFS_size)(s_op->u.pipeline.buffer_used - 
+			    file_req_offset)/((*PVFS_INT).ub);
+	gossip_debug(GOSSIP_IO_DEBUG, "count=%lld\n", lld(count));
+	strip_boundary = ((int)(loff/(dparam->strip_size)))*(dparam->strip_size);
+	s_op->u.pipeline.unaligned_sz = loff-strip_boundary;
+	
+	if (loff == strip_boundary && file_req_offset != 0) {
+	    s_op->u.pipeline.unaligned_sz = file_req_offset;
+	}
+
+	if (s_op->u.pipeline.unaligned_sz != 0 && count != 0) {
+	    js_p->error_code = UNALIGNED;
+	    gossip_debug(GOSSIP_IO_DEBUG, "unaligned_sz=%lld\n", 
+			 lld(s_op->u.pipeline.unaligned_sz));
+	}
+	break;
+    case ((int)0x4c00040a): /* MPI_FLOAT */
+	count = (PVFS_size)(s_op->u.pipeline.buffer_used)/((*PVFS_FLOAT).ub);
+	if(s_op->u.pipeline.op == 0x5800000f) { /* KMEANS */
+	    char *tmpbuf = malloc(TMP_BUF_SIZ);
+	    int cunit, length;
+	    char *tok;
+
+	    memcpy(tmpbuf, PINT_hint_get_value_by_name(s_op->u.pipeline.hints, "kmeans", &length), TMP_BUF_SIZ);
+	    gossip_debug(GOSSIP_IO_DEBUG, "kmeans=%s\n", tmpbuf);
+	    tok = strtok(tmpbuf, ":");
+	    tok = strtok(NULL, ":");
+	    tok = strtok(NULL, ":");
+	    NUM_COORDS = atoi(tok);
+
+	    free(tmpbuf);
+	    
+	    cunit = ((*PVFS_FLOAT).ub)*NUM_COORDS;
+	    PVFS_size new_size, left_adj_sz, right_adj_sz;
+	    float ctmp = ((float)(s_op->u.pipeline.buffer_used-file_req_offset))/((*PVFS_FLOAT).ub)/NUM_COORDS;
+	    int is_last_stripe = ((s_op->u.pipeline.dfile_index == (s_op->u.pipeline.dfile_count-1))?1:0);
+
+	    gossip_debug(GOSSIP_IO_DEBUG, "ctmp=%f\n", ctmp);
+
+	    /* last stripe? */
+	    if(is_last_stripe && (s_op->u.pipeline.dfile_index != 0))
+		count = floor(ctmp);
+	    else
+		count = ceil(ctmp);
+
+	    new_size = count*cunit;
+	    s_op->u.pipeline.new_buffer_used = new_size;
+	    s_op->u.pipeline.buffer = realloc(s_op->u.pipeline.buffer, max(new_size, s_op->u.pipeline.buffer_used));
+	    left_adj_sz = (loff - file_req_offset)%cunit;
+	    right_adj_sz = (loff+s_op->u.pipeline.buffer_used-file_req_offset)%cunit;
+	    s_op->u.pipeline.left_adj_sz = ((left_adj_sz==0)?0:(cunit-left_adj_sz));
+	    s_op->u.pipeline.right_adj_sz = right_adj_sz;
+	    s_op->u.pipeline.unaligned_sz = ((right_adj_sz==0)?0:(cunit-right_adj_sz));
+	    s_op->u.pipeline.tmp_buf = malloc(s_op->u.pipeline.unaligned_sz);
+	    
+	    gossip_debug(GOSSIP_IO_DEBUG, "FLOAT: count=%lld, left_adj_sz=%ld, "
+			 "right_adj_sz=%ld, unaligned_sz=%ld\n", lld(count),
+			 s_op->u.pipeline.left_adj_sz, 
+			 s_op->u.pipeline.right_adj_sz, 
+			 s_op->u.pipeline.unaligned_sz);
+	}
+	gossip_debug(GOSSIP_IO_DEBUG, "strip_size=%ld, count=%lld\n", 
+		     dparam->strip_size, lld(count));
+#if 0
+	strip_boundary = ((int)(loff/(dparam->strip_size)))*(dparam->strip_size);
+	s_op->u.pipeline.unaligned_sz = loff-strip_boundary;
+	if(dparam->strip_size > (count*(*PVFS_FLOAT).ub)) {
+	    s_op->u.pipeline.unaligned_sz = dparam->strip_size - 
+		(count*((*PVFS_FLOAT).ub));
+	    if(s_op->u.pipeline.op == 0x5800000f)
+		s_op->u.pipeline.unaligned_sz = dparam->strip_size
+		    - (count*((*PVFS_FLOAT).ub)*NUM_COORDS);
+	}
+#endif
+#if 0	
+	if (loff == strip_boundary && file_req_offset != 0) {
+	    s_op->u.pipeline.unaligned_sz = file_req_offset;
+	}
+#endif
+	if (s_op->u.pipeline.unaligned_sz != 0 && count != 0) {
+	    /* if it is the last stripe, no need to bring data */
+	    /* FIXME: we assume no round-robin stripes for now, 
+	       but shound't it be more general? */
+	    if(s_op->u.pipeline.dfile_index != (s_op->u.pipeline.dfile_count-1))
+		js_p->error_code = UNALIGNED;
+	    gossip_debug(GOSSIP_IO_DEBUG, "unaligned_sz=%lld\n", 
+			 lld(s_op->u.pipeline.unaligned_sz));
+	}
+	break;
+    case ((int)0x4c00080b): /* MPI_DOUBLE */
+        break; /* sson: FIXME */
+	count = (PVFS_size)(s_op->u.pipeline.buffer_used - 
+			    file_req_offset)/((*PVFS_DOUBLE).ub);
+	gossip_debug(GOSSIP_IO_DEBUG, "count=%lld\n", lld(count));
+	strip_boundary = ((int)(loff/(dparam->strip_size)))*(dparam->strip_size); /* FIXME */
+	s_op->u.pipeline.unaligned_sz = loff-strip_boundary;
+
+	if (loff == strip_boundary && file_req_offset != 0) {
+	    s_op->u.pipeline.unaligned_sz = file_req_offset;
+	}
+	
+	if (s_op->u.pipeline.unaligned_sz != 0 && count != 0) {
+	    js_p->error_code = UNALIGNED;
+	    gossip_debug(GOSSIP_IO_DEBUG, "unaligned_sz=%lld\n", 
+			 lld(s_op->u.pipeline.unaligned_sz));
+	}
+	break;
+    }
+
+    return SM_ACTION_COMPLETE;
+}
+
+
+static PINT_sm_action setup_s2s_msg(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    PINT_sm_msgpair_state *msg_p = NULL;
+    struct server_configuration_s *user_opts = get_server_config_struct();
+    int regions;
+    int ret;
+    PVFS_credentials creds;
+    int next_server_index;
+    PVFS_handle next_server_handle;
+    PINT_request_file_data fdata = s_op->u.pipeline.file_data;
+    PVFS_simple_stripe_params *dparam = 
+	(PVFS_simple_stripe_params*)fdata.dist->params;
+
+    /* init msgpair */
+    PINT_msgpair_init(&s_op->msgarray_op);
+    msg_p = &s_op->msgarray_op.msgpair;
+
+    s_op->msgarray_op.params.job_timeout = user_opts->client_job_bmi_timeout;
+    s_op->msgarray_op.params.retry_delay = user_opts->client_retry_delay_ms;
+    s_op->msgarray_op.params.retry_limit = user_opts->client_retry_limit;
+    s_op->msgarray_op.params.quiet_flag = 1;
+
+    PINT_util_gen_credentials(&creds);
+    gossip_debug(GOSSIP_IO_DEBUG, "loff=%lld, buffer_used=%lld\n", lld(s_op->u.pipeline.loff), lld(s_op->u.pipeline.buffer_used));
+
+    /* determine which server we need to talk to */
+    next_server_index = (s_op->u.pipeline.dfile_index + 1)%(s_op->u.pipeline.dfile_count);
+    next_server_handle = s_op->u.pipeline.dfile_array[next_server_index];
+
+    /* build a request */
+    ret = PVFS_Request_contiguous(s_op->u.pipeline.unaligned_sz, 
+				  PVFS_BYTE, &s_op->u.pipeline.file_req);
+    
+    /* strip_size from dparam */
+    s_op->u.pipeline.file_req_offset = (((int)(s_op->u.pipeline.loff/dparam->strip_size))+1)*dparam->strip_size;
+
+    regions = 1;
+    gossip_debug(GOSSIP_IO_DEBUG, "s_op->u.pipeline.file_req_offset=%lld\n", lld(s_op->u.pipeline.file_req_offset));
+
+    PINT_SERVREQ_SMALL_IO_FILL(msg_p->req,
+			       creds,
+			       s_op->u.pipeline.fs_id,
+			       next_server_handle,
+			       s_op->u.pipeline.io_type,
+			       next_server_index,
+			       s_op->u.pipeline.dfile_count,
+			       s_op->u.pipeline.dist,
+			       s_op->u.pipeline.file_req,
+			       s_op->u.pipeline.file_req_offset,
+			       regions,
+			       s_op->u.pipeline.unaligned_sz,
+			       NULL /* s_op->hints */);
+
+    msg_p->fs_id = s_op->u.pipeline.fs_id;
+    msg_p->handle = next_server_handle;
+    msg_p->retry_flag = PVFS_MSGPAIR_RETRY;
+    msg_p->comp_fn = s2s_comp_fn;
+
+    ret = PINT_cached_config_map_to_server(&msg_p->svr_addr, 
+					   next_server_handle,
+					   s_op->u.pipeline.fs_id);
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: msg_p->svr_addr=%llu\n", __func__,
+		 llu(msg_p->svr_addr));
+    if(ret < 0) {
+	gossip_err("Failed to map meta server address\n");
+	js_p->error_code = ret;
+	return SM_ACTION_COMPLETE;
+    }
+
+    js_p->error_code = 0;
+
+    PINT_sm_push_frame(smcb, 0, &s_op->msgarray_op);
+    return SM_ACTION_COMPLETE;
+}
+
+static int s2s_comp_fn(void *v_p, struct PVFS_server_resp *resp_p,
+			int index)
+{
+    PINT_smcb *smcb = v_p;
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_MSGPAIR_PARENT_SM);
+
+    gossip_debug(GOSSIP_IO_DEBUG, "%s called\n", __func__);
+    gossip_debug(GOSSIP_IO_DEBUG, "resp_p->status=%d\n", resp_p->status);
+    gossip_debug(GOSSIP_IO_DEBUG, "small_io: result_size=%lld\n", 
+		     lld(resp_p->u.small_io.result_size));
+
+    assert(resp_p->op == PVFS_SERV_SMALL_IO);
+
+    if (resp_p->status != 0) {
+	return resp_p->status;
+    }
+
+    if(resp_p->u.small_io.result_size != 0) {
+	int i, count = (resp_p->u.small_io.result_size)/4;
+	float *a = (float*)resp_p->u.small_io.buffer;
+	float *b;
+	memcpy(s_op->u.pipeline.tmp_buf, resp_p->u.small_io.buffer, 
+	       resp_p->u.small_io.result_size);
+	b = (float*)s_op->u.pipeline.tmp_buf;
+	for(i=0; i<count; i++) {
+	    gossip_debug(GOSSIP_IO_DEBUG, "%s: a[%d]=%f, b[%d]=%f\n", __func__, i, a[i], i, b[i]);
+	}
+    }
+
+    return 0;
+}
+
+static PINT_sm_action do_comp_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct PINT_server_op *parent_s_op = PINT_sm_frame(smcb->parent_smcb, 0);
+    js_p->error_code = 0;
+
+    if(s_op->u.pipeline.buffer) {
+	PVFS_size i;
+	gossip_debug(GOSSIP_FLOW_PROTO_DEBUG,
+		     "%s: buffer_used=%lld, op=0x%x, "
+		     "datatype=0x%x, actual_size=%lld\n", 
+		     __func__, lld(s_op->u.pipeline.buffer_used), 
+		     s_op->u.pipeline.op, 
+		     s_op->u.pipeline.datatype,
+		     lld(js_p->actual_size)); /* AS */
+
+	switch(s_op->u.pipeline.datatype) {
+        case ((int)0x4c000101): /* MPI_CHAR */
+        {
+            char *a = (char*)s_op->u.pipeline.buffer;
+            char result;
+            PVFS_size count = (s_op->u.pipeline.buffer_used-s_op->u.pipeline.unaligned_sz)/((*PVFS_CHAR).ub);
+            char *tmp;
+            
+            if(count == 0)
+                return SM_ACTION_COMPLETE;
+            /* data is not aligned perfectly, so adjust it */
+            if(s_op->u.pipeline.unaligned_sz != 0) {
+                memcpy(((char*)&a[count])+(((*PVFS_CHAR).ub)-s_op->u.pipeline.unaligned_sz), s_op->u.pipeline.tmp_buf, s_op->u.pipeline.unaligned_sz);
+                count++;
+            }
+            
+            if (parent_s_op->u.io.total_transferred == 0) {
+                if (parent_s_op->u.io.tmp_buffer == NULL)
+                    parent_s_op->u.io.tmp_buffer = (void *)malloc(1*sizeof(char));
+                memset(parent_s_op->u.io.tmp_buffer, 0, sizeof(char));
+                parent_s_op->u.io.count = 0;
+            }
+            tmp = parent_s_op->u.io.tmp_buffer;
+            gossip_debug(GOSSIP_IO_DEBUG, "total_transferred=%lld\n", lld(parent_s_op->u.io.total_transferred));
+            //gossip_debug(GOSSIP_IO_DEBUG, "count=%lld, tmp=%c\n", lld(count), *tmp);
+            
+            switch(s_op->u.pipeline.op) {
+            case 0x58000001: /* MAX */
+                result = *a;
+                for (i=1; i<count; i++ ) {
+                    if (a[i] > result) {
+                        result = a[i];
+                    }
+                }
+                a[0] = result;
+                if (parent_s_op->u.io.total_transferred == 0 ||
+                    result > *tmp)
+                    *tmp = result;
+                break;
+            case 0x58000002: /* MIN */
+                result = *a;
+                for (i=1; i<count; i++ ) {
+                    if (a[i] < result) {
+                        result = a[i];
+                    }
+                }
+                a[0] = result;
+                if (parent_s_op->u.io.total_transferred == 0 ||
+                    result < *tmp)
+                    *tmp = result;
+                break;
+            case 0x58000003: /* SUM */
+                result = 0;
+                for (i=0; i<count; i++ ) {
+                    if (i<10) 
+                        gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "a[%lld]=%d\n", 
+                                     lld(i), a[i]);
+                    result += a[i];
+                }
+                a[0] = result;
+                *tmp += result;
+                gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "sum=%d\n", 
+                             *tmp);
+                break;
+            case (0x5800000e): /* MEAN */
+                result = 0;
+                for (i=0; i<count; i++) {
+                    result += a[i];
+                }
+                result = result/count;
+                a[0] = result;
+		
+                if (parent_s_op->u.io.count == 0)
+                    *tmp = result;
+                else {
+                    int tmp_sum = (*tmp)*(parent_s_op->u.io.count);
+                    tmp_sum = tmp_sum + result*count;
+                    *tmp = (tmp_sum)/(parent_s_op->u.io.count+count);
+                }
+                parent_s_op->u.io.count += count;
+                gossip_debug(GOSSIP_IO_DEBUG, "mean=%d\n", *tmp);
+                break;
+            case (0x58000020): /* GREP */
+            {
+                char *tmp_buf = (char *)s_op->u.pipeline.buffer;
+                char myString[s_op->u.pipeline.rsize];
+                int nrecord = count/(s_op->u.pipeline.rsize);
+
+                for(i=0; i<nrecord; i++) {
+                    strncpy(myString, tmp_buf, s_op->u.pipeline.rsize);
+                    //gossip_debug(GOSSIP_IO_DEBUG, "%s: string=%s\n", __func__, myString);
+                    if(strstr(myString, s_op->u.pipeline.pattern)) {
+                        gossip_debug(GOSSIP_IO_DEBUG, "Found by rank(%d):"
+                                     " %s\n", s_op->u.pipeline.dfile_index, myString);
+                    }
+                    tmp_buf += s_op->u.pipeline.rsize;
+                }
+            }
+                break;
+            default:
+                break;
+            }
+            s_op->u.pipeline.buffer = (void *)a;
+            parent_s_op->u.io.tmp_buffer = (void *)tmp;
+        }
+        break;
+
+	case ((int)0x4c000405): /* MPI_INT */
+	    {
+		int *a = (int*)s_op->u.pipeline.buffer;
+		int result;
+		PVFS_size count = (s_op->u.pipeline.buffer_used-s_op->u.pipeline.unaligned_sz)/((*PVFS_INT).ub);
+		int *tmp;
+
+		if(count == 0)
+		    return SM_ACTION_COMPLETE;
+		/* data is not aligned perfectly, so adjust it */
+		if(s_op->u.pipeline.unaligned_sz != 0) {
+		    memcpy(((char*)&a[count])+(((*PVFS_INT).ub)-s_op->u.pipeline.unaligned_sz), s_op->u.pipeline.tmp_buf, s_op->u.pipeline.unaligned_sz);
+		    count++;
+		}
+		
+		if (parent_s_op->u.io.total_transferred == 0) {
+		    if (parent_s_op->u.io.tmp_buffer == NULL)
+			parent_s_op->u.io.tmp_buffer = (void *)malloc(1*sizeof(int));
+		    memset(parent_s_op->u.io.tmp_buffer, 0, sizeof(int));
+		    parent_s_op->u.io.count = 0;
+		}
+		tmp = parent_s_op->u.io.tmp_buffer;
+		gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "total_transferred=%lld\n", lld(parent_s_op->u.io.total_transferred));
+		gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "count=%lld, tmp=%d\n", lld(count), *tmp);
+
+		switch(s_op->u.pipeline.op) {
+		case 0x58000001: /* MAX */
+		    result = *a;
+		    for (i=1; i<count; i++ ) {
+			if (a[i] > result) {
+			    result = a[i];
+			}
+		    }
+		    a[0] = result;
+		    if (parent_s_op->u.io.total_transferred == 0 ||
+			result > *tmp)
+			*tmp = result;
+		    break;
+		case 0x58000002: /* MIN */
+		    result = *a;
+		    for (i=1; i<count; i++ ) {
+			if (a[i] < result) {
+			    result = a[i];
+			}
+		    }
+		    a[0] = result;
+		    if (parent_s_op->u.io.total_transferred == 0 ||
+			result < *tmp)
+			*tmp = result;
+		    break;
+		case 0x58000003: /* SUM */
+		    result = 0;
+		    for (i=0; i<count; i++ ) {
+			if (i<10) 
+			    gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "a[%lld]=%d\n", 
+					 lld(i), a[i]);
+			result += a[i];
+		    }
+		    a[0] = result;
+		    *tmp += result;
+		    gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "sum=%d\n", 
+				 *tmp);
+		    break;
+		case (0x5800000e): /* MEAN */
+		    result = 0;
+		    for (i=0; i<count; i++) {
+			result += a[i];
+		    }
+		    result = result/count;
+		    a[0] = result;
+		    
+		    if (parent_s_op->u.io.count == 0)
+			*tmp = result;
+		    else {
+			int tmp_sum = (*tmp)*(parent_s_op->u.io.count);
+			tmp_sum = tmp_sum + result*count;
+			*tmp = (tmp_sum)/(parent_s_op->u.io.count+count);
+		    }
+		    parent_s_op->u.io.count += count;
+		    gossip_debug(GOSSIP_IO_DEBUG, "mean=%d\n", *tmp);
+		    break;
+		default:
+		    break;
+		}
+		s_op->u.pipeline.buffer = (void *)a;
+		parent_s_op->u.io.tmp_buffer = (void *)tmp;
+	    }
+	    break;
+
+	case ((int)0x4c00040a): /* MPI_FLOAT */
+	    {
+		/* NUM_COORDS is used only when kmeans, 
+		   otherwise it is set to default 0 */
+		PVFS_size count = s_op->u.pipeline.new_buffer_used/((*PVFS_FLOAT).ub)/NUM_COORDS;
+
+		float *a = (float*)s_op->u.pipeline.buffer;
+
+		gossip_debug(GOSSIP_IO_DEBUG, "%s: count=%ld\n", __func__, count);
+
+		/* data is not aligned perfectly, then adjust it in memory */
+		if(s_op->u.pipeline.left_adj_sz != 0 || 
+		   s_op->u.pipeline.right_adj_sz != 0) {
+		    if(s_op->u.pipeline.dfile_index != 0) {
+			memcpy(s_op->u.pipeline.buffer, ((char*)&s_op->u.pipeline.buffer[0])+s_op->u.pipeline.left_adj_sz,
+			       s_op->u.pipeline.buffer_used - 
+			       s_op->u.pipeline.left_adj_sz);
+		    }
+		    
+		    /* patch the missing data from adjacent servers */
+		    if(s_op->u.pipeline.dfile_index != (s_op->u.pipeline.dfile_count-1)) {
+			float *aa = (float*)s_op->u.pipeline.tmp_buf;
+			gossip_debug(GOSSIP_IO_DEBUG, "%s: tmp_buf[0]=%f\n", __func__, aa[0]);
+			gossip_debug(GOSSIP_IO_DEBUG, "%s: tmp_buf[1]=%f\n", __func__, aa[1]);
+			memcpy(s_op->u.pipeline.buffer+(s_op->u.pipeline.buffer_used-s_op->u.pipeline.left_adj_sz), 
+			       s_op->u.pipeline.tmp_buf, s_op->u.pipeline.unaligned_sz);
+		    }
+		}
+		
+		free(s_op->u.pipeline.tmp_buf);
+
+		switch(s_op->u.pipeline.op) {
+		case 0x58000001: /* MAX */
+		    break;
+		case 0x58000002: /* MIN */
+		    break;
+		case 0x58000003: /* SUM */ 
+		    break;
+		case (0x5800000e): /* MEAN */
+		    break;
+		case (0x5800000f): /* KMEANS */
+		    js_p->error_code = DO_KMEANS;
+		    break;
+		default:
+		    break;
+		}
+	    }
+	    break;
+
+	case ((int)0x4c00080b): /* MPI_DOUBLE */
+	    {
+		double *a = (double*)s_op->u.pipeline.buffer;
+		double result;
+		PVFS_size count = (s_op->u.pipeline.buffer_used-s_op->u.pipeline.unaligned_sz)/((*PVFS_DOUBLE).ub);
+		double *tmp;
+		PVFS_offset strip_boundary = (int)(s_op->u.pipeline.loff/262144)*262144; /* FIXME */
+
+		if (s_op->u.pipeline.buffer_used < 262144 && 
+		    s_op->u.pipeline.loff != strip_boundary) { /* FIXME */
+		    count = (s_op->u.pipeline.buffer_used)/((*PVFS_DOUBLE).ub);
+		}
+		gossip_debug(GOSSIP_IO_DEBUG, "count=%lld\n", lld(count));
+		if(count < 1)
+		    return SM_ACTION_COMPLETE;
+
+		/* data is not aligned perfectly, so adjust it within the memory*/
+		if(s_op->u.pipeline.unaligned_sz != 0) {
+		    PVFS_size adj_sz = s_op->u.pipeline.unaligned_sz;
+		    PVFS_size tmp_sz = ((*PVFS_DOUBLE).ub) - adj_sz;
+		    
+		    if(s_op->u.pipeline.loff == strip_boundary) {
+			memcpy(a, (char*)&a[0]+adj_sz,
+			       s_op->u.pipeline.buffer_used-adj_sz);
+		    }
+
+		    memcpy(((char*)&a[count])+tmp_sz, s_op->u.pipeline.tmp_buf, 
+			   s_op->u.pipeline.unaligned_sz);
+
+
+		    count++;
+		    
+		    /* FIXME: 262144 -> should be from strip_size */
+		    if(s_op->u.pipeline.buffer_used < (262144-((*PVFS_DOUBLE).ub)))
+			count--;
+		}
+
+		if (parent_s_op->u.io.total_transferred == 0) {
+		    if (parent_s_op->u.io.tmp_buffer == NULL)
+			parent_s_op->u.io.tmp_buffer = (void *)malloc(1*sizeof(double));
+		    memset( parent_s_op->u.io.tmp_buffer, 0, sizeof(double));
+		    parent_s_op->u.io.count = 0;
+		}
+		tmp = parent_s_op->u.io.tmp_buffer;
+		gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, 
+			     "total_transferred=%lld\n",
+			     lld(parent_s_op->u.io.total_transferred));
+		gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "count=%lld, tmp=%lf\n", 
+			     lld(count), *tmp);
+		switch(s_op->u.pipeline.op) {
+		case 0x58000001: /* MAX */
+		    result = *a;
+		    for (i=1; i<count; i++ ) {
+			if (a[i] > result) {
+			    result = a[i];
+			}
+		    }
+		    a[0] = result;
+		    if (parent_s_op->u.io.total_transferred == 0 ||
+			result > *tmp)
+			*tmp = result;
+		    gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "max=%lf\n", *tmp);
+		    break;
+		case 0x58000002: /* MIN */
+		    result = *a;
+		    for (i=1; i<count; i++ ) {
+			if (a[i] < result) {
+			    result = a[i];
+			}
+		    }
+
+		    a[0] = result;
+		    if (parent_s_op->u.io.total_transferred == 0 ||
+			result < *tmp)
+			*tmp = result;
+		    gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "min=%lf\n", 
+				 *tmp);
+		    break;
+		case 0x58000003: /* SUM */
+		    result = 0;
+		    for (i=0; i<count; i++ ) {
+			if (i<10 || i== (count-1) || i == count) gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "a[%lld]=%lf\n", lld(i), a[i]);
+			result += a[i];
+		    }
+
+		    a[0] = result;
+		    *tmp += result;
+		    gossip_debug(GOSSIP_FLOW_PROTO_DEBUG, "sum=%lf, local sum=%lf\n", 
+				 *tmp, result);
+		    break;    
+		case (0x5800000e): /* MEAN */
+		    result = 0;
+		    for (i=0; i<count; i++) {
+			result += a[i];
+		    }
+		    result = result/count;
+		    a[0] = result;
+
+		    gossip_debug(GOSSIP_IO_DEBUG, "count=%lld\n", lld(parent_s_op->u.io.count));
+
+		    if (parent_s_op->u.io.count == 0)
+			*tmp = result;
+		    else {
+			double tmp_sum = (*tmp)*(parent_s_op->u.io.count);
+			tmp_sum = tmp_sum + result*count;
+			*tmp = (tmp_sum)/(parent_s_op->u.io.count+count);
+		    }
+		    parent_s_op->u.io.count += count;
+		    gossip_debug(GOSSIP_IO_DEBUG, "mean=%lf\n", result);
+		    break;
+		case (0x5800000f): /* KMEANS */ {
+#if 0
+		    int index, numObjs, j;
+		    int numClusters=2, numCoords=4;
+		    double delta;
+		    
+		    for(i=0; i<numObjs; i++) {
+			//result = a[i];
+			index = find_nearest_cluster(numClusters, numCoords, a[i], clusters);
+			if(membership[i] != index) delta += 1.0;
+			membership[i] = index;
+
+			newClusterSize[index]++;
+			for(j=0; j<numCoords; j++)
+			    newClusters[index][j] += objects[i][j];
+		    }
+#endif
+		    js_p->error_code = DO_ALLREDUCE;
+		    break;
+		}
+		default:
+		    break;
+		} /* end inner switch */
+		s_op->u.pipeline.buffer = (void *)a;
+		parent_s_op->u.io.tmp_buffer = (void *)tmp;
+                double *tmp1;
+                tmp1 = parent_s_op->u.io.tmp_buffer;
+                gossip_debug(GOSSIP_IO_DEBUG, "%s: sum=%lf\n", __func__, *tmp1);
+	    }
+	    
+	    break;
+	default:
+	    break;
+	} /* end switch() */
+    } /* end if() */
+
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action setup_kmeans_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    int ret, i, j;
+    struct PINT_server_op *kmeans_op;
+    int numClusters;
+    int numCoords;
+    char *tmpbuf, *tok;
+    int length;
+
+    kmeans_op = malloc(sizeof(*kmeans_op));
+    memset(kmeans_op, 0, sizeof(*kmeans_op));
+
+    kmeans_op->u.kmeans.myRank = s_op->u.pipeline.dfile_index;
+    kmeans_op->u.kmeans.dfile_array = s_op->u.pipeline.dfile_array;
+    kmeans_op->u.kmeans.dfile_count = s_op->u.pipeline.dfile_count;
+    kmeans_op->u.kmeans.fs_id = s_op->u.pipeline.fs_id;
+    kmeans_op->u.kmeans.allreduce_step = 0;
+
+    tmpbuf = malloc(TMP_BUF_SIZ);
+
+    memcpy(tmpbuf, PINT_hint_get_value_by_name(s_op->u.pipeline.hints, "kmeans", &length), TMP_BUF_SIZ);
+    gossip_debug(GOSSIP_IO_DEBUG, "kmeans=%s\n", tmpbuf);
+    tok = strtok(tmpbuf, ":");
+    kmeans_op->u.kmeans.use_gpu = atoi(tok);
+    tok = strtok(NULL, ":");
+    kmeans_op->u.kmeans.totalNumObjs = atoi(tok);
+    tok = strtok(NULL, ":");
+    kmeans_op->u.kmeans.numCoords = atoi(tok);
+    numCoords = kmeans_op->u.kmeans.numCoords;
+    tok = strtok(NULL, ":");
+    kmeans_op->u.kmeans.numClusters = atoi(tok);
+    numClusters = kmeans_op->u.kmeans.numClusters;
+    tok = strtok(NULL, ":");
+    kmeans_op->u.kmeans.threshold = atof(tok);
+
+    free(tmpbuf);
+
+    kmeans_op->u.kmeans.numObjs = s_op->u.pipeline.new_buffer_used/sizeof(float)/numCoords;
+    gossip_debug(GOSSIP_IO_DEBUG, "totalNumObjs=%d\n", kmeans_op->u.kmeans.totalNumObjs);
+    gossip_debug(GOSSIP_IO_DEBUG, "numObjs=%d\n", kmeans_op->u.kmeans.numObjs);
+    gossip_debug(GOSSIP_IO_DEBUG, "numCoords=%d, numClusters=%d\n", 
+		 numCoords, numClusters);
+
+    /* allocate space for data points */
+    kmeans_op->u.kmeans.objects = (float**)malloc((kmeans_op->u.kmeans.numObjs) * sizeof(float*));
+    assert(kmeans_op->u.kmeans.objects != NULL);
+    kmeans_op->u.kmeans.objects[0] = (float*) malloc((kmeans_op->u.kmeans.numObjs)*(numCoords) * sizeof(float));
+    assert(kmeans_op->u.kmeans.objects[0] != NULL);
+    for (i=1; i<kmeans_op->u.kmeans.numObjs; i++)
+	kmeans_op->u.kmeans.objects[i] = kmeans_op->u.kmeans.objects[i-1] + (numCoords);
+
+    /* allocate a 2D space for clusters[] (coordinates of cluster centers)
+       this array should be the same across all processes */
+    kmeans_op->u.kmeans.clusters = (float **)malloc(numClusters*sizeof(float*));
+    assert(kmeans_op->u.kmeans.clusters != NULL);
+    kmeans_op->u.kmeans.clusters[0] = (float *)malloc(numClusters*numCoords*sizeof(float));
+    assert(kmeans_op->u.kmeans.clusters[0] != NULL);
+
+    for(i=1; i<numClusters; i++)
+	kmeans_op->u.kmeans.clusters[i] = kmeans_op->u.kmeans.clusters[i-1] + numCoords;
+
+    /* FIXME: better way to copy the read data to objects[][]?? */
+    for(i=0; i<kmeans_op->u.kmeans.numObjs; i++)
+	memcpy(kmeans_op->u.kmeans.objects[i],
+	       s_op->u.pipeline.buffer+(i*kmeans_op->u.kmeans.numCoords*sizeof(float)),
+	       kmeans_op->u.kmeans.numCoords*sizeof(float));
+
+    /* print the first 4 objects' coordinates */
+    {
+        int num = (kmeans_op->u.kmeans.numObjs < 4) ? kmeans_op->u.kmeans.numObjs : 4;
+        for (i=0; i<num; i++) {
+            gossip_debug(GOSSIP_IO_DEBUG, "%d: objects[%d]= \n", s_op->u.pipeline.dfile_index, i);
+            for (j=0; j<kmeans_op->u.kmeans.numCoords; j++) {
+                gossip_debug(GOSSIP_IO_DEBUG, "\t%10f\n", kmeans_op->u.kmeans.objects[i][j]);
+            }
+            //gossip_debug(GOSSIP_IO_DEBUG, "\n");
+        }
+	/* print out the last object's coordinates */
+	gossip_debug(GOSSIP_IO_DEBUG, "%d: objects[%d]= \n", s_op->u.pipeline.dfile_index, kmeans_op->u.kmeans.numObjs-1);
+	for(j=0; j<kmeans_op->u.kmeans.numCoords; j++)
+	    gossip_debug(GOSSIP_IO_DEBUG, "\t%10f\n", kmeans_op->u.kmeans.objects[kmeans_op->u.kmeans.numObjs-1][j]);
+    }
+
+    /* pick first numClusters elements in feature[] as initial cluster centers*/
+    if(s_op->u.pipeline.dfile_index == 0) {
+	for (i=0; i<numClusters; i++)
+            for (j=0; j<numCoords; j++) {
+                kmeans_op->u.kmeans.clusters[i][j] = kmeans_op->u.kmeans.objects[i][j];
+		gossip_debug(GOSSIP_IO_DEBUG, "clusters[%d][%d]=%lf\n", i, j, kmeans_op->u.kmeans.clusters[i][j]);
+	    }
+    }
+    
+    kmeans_op->u.kmeans.allreduce_step = 0;
+
+    ret = PINT_sm_push_frame(smcb, 0, kmeans_op);
+
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action cleanup_kmeans_fn(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    int task_id;
+    int remaining;
+    PVFS_error tmp_err;
+    struct PINT_server_op *kmeans_op;
+    int i, j;
+
+    kmeans_op = PINT_sm_pop_frame(smcb, &task_id, &tmp_err, 
+            &remaining);
+    gossip_debug(GOSSIP_SERVER_DEBUG, 
+		 "pipeline: nested sm (kmeans) returned error code: %d\n", tmp_err);
+    //memcpy(s_op->u.pipeline.buffer, kmeans_op->u.kmeans.send_buf, FIXME);
+    //free(kmeans_op->u.kmeans.clusters[0]);
+#if 0
+    /* print out the result: clusters[][] */
+    for (i=0; i<kmeans_op->u.kmeans.numClusters; i++) 
+	for (j=0; j<kmeans_op->u.kmeans.numCoords; j++) 
+	    gossip_debug(GOSSIP_IO_DEBUG, "clusters[%d][%d]=%f\n", i, j,
+			 kmeans_op->u.kmeans.clusters[i][j]);
+
+    /* print out the membership of each object */
+    for (j=0; j<kmeans_op->u.kmeans.numObjs; j++)
+	gossip_debug(GOSSIP_IO_DEBUG, "%d: %d\n", j, kmeans_op->u.kmeans.membership[j]);
+#endif 
+    free(kmeans_op->u.kmeans.clusters);
+    free(kmeans_op);
+
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+static PINT_sm_action check_pipeline_done(struct PINT_smcb *smcb, job_status_s *js_p)
+{
+    struct PINT_server_op *s_op = PINT_sm_frame(smcb, PINT_FRAME_CURRENT);
+    struct PINT_server_op *parent_s_op = PINT_sm_frame(smcb->parent_smcb, 0);
+    PINT_segpool_handle_t h = s_op->u.pipeline.seg_handle;
+    js_p->error_code = 0;
+
+    struct timeval tv; 
+    gettimeofday(&tv, NULL);
+    if(s_op->u.pipeline.io_type == PVFS_IO_READ) {
+        bs2 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        //printf("end(%s): %f\n", "BMI_SEND", bs2);
+        //printf("bmi_time=%f\n", bmi_time);
+        bmi_time += bs2-bs1;
+    }
+    else if(s_op->u.pipeline.io_type == PVFS_IO_WRITE) {
+        tw2 = tv.tv_sec+(tv.tv_usec/1000000.0);
+        trove_time += tw2-tw1;
+    }
+
+    /* FIMXE: do we really need this lock? */
+    gen_mutex_lock(&parent_s_op->u.io.mutex);
+    /* update the total_transferred */
+    parent_s_op->u.io.total_transferred += s_op->u.pipeline.buffer_used;
+    gen_mutex_unlock(&parent_s_op->u.io.mutex);
+    
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: total_transferred=%lld\n", __func__,
+		 lld(parent_s_op->u.io.total_transferred));
+    gossip_debug(GOSSIP_IO_DEBUG, "%s: actual_size=%lld\n", __func__,
+		 lld(js_p->actual_size));
+
+    js_p->error_code = 0;
+    return SM_ACTION_COMPLETE;
+}
+
+/*
+ * Local variables:
+ *  mode: c
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */
